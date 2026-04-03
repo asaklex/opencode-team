@@ -58,7 +58,7 @@ export namespace Orchestrator {
   }
 
   function unresolved(workers: Plan["workers"]) {
-    return workers.filter((worker) => !["done", "merged", "failed", "conflict"].includes(worker.status))
+    return workers.filter((worker) => !["done", "merged", "failed", "conflict", "blocked"].includes(worker.status))
   }
 
   function inflight(workers: Plan["workers"]) {
@@ -799,12 +799,69 @@ export namespace Orchestrator {
     const afterWait = await PlanStore.get(planID)
     const active = inflight(afterWait.workers)
     if (active.length > 0) {
+      // Detailed analysis of why workers are still "active"
+      const statusCounts = afterWait.workers.reduce((acc, w) => {
+        acc[w.status] = (acc[w.status] || 0) + 1
+        return acc
+      }, {} as Record<string, number>)
+      
+      const unresolvedWorkers = unresolved(afterWait.workers)
+      const blockedWorkers = afterWait.workers.filter((w) => w.status === "blocked")
+      const runningWorkers = afterWait.workers.filter((w) => w.status === "running")
+      const spawningWorkers = afterWait.workers.filter((w) => w.status === "spawning")
+      const pendingWorkers = afterWait.workers.filter((w) => w.status === "pending")
+      
+      log.error("workers still active after wait; detailed breakdown before kill", {
+        planID,
+        activeCount: active.length,
+        totalWorkers: afterWait.workers.length,
+        statusBreakdown: statusCounts,
+        activeWorkerDetails: {
+          running: {
+            count: runningWorkers.length,
+            workers: runningWorkers.map((w) => ({
+              subtaskID: w.subtaskID,
+              status: w.status,
+              error: w.error?.substring(0, 200)
+            })),
+            whyActive: "still executing task code"
+          },
+          spawning: {
+            count: spawningWorkers.length,
+            workers: spawningWorkers.map((w) => ({
+              subtaskID: w.subtaskID,
+              status: w.status
+            })),
+            whyActive: "initialization/startup in progress"
+          },
+          pending: {
+            count: pendingWorkers.length,
+            workers: pendingWorkers.map((w) => ({
+              subtaskID: w.subtaskID,
+              status: w.status
+            })),
+            whyActive: "waiting for dependencies or wave scheduling"
+          }
+        },
+        blockedWorkers: {
+          count: blockedWorkers.length,
+          workers: blockedWorkers.map((w) => ({
+            subtaskID: w.subtaskID,
+            status: w.status,
+            error: w.error?.substring(0, 200)
+          })),
+          note: "blocked workers are NOT considered 'active' by inflight(), but may indicate dependency issues"
+        },
+        unresolvedCount: unresolvedWorkers.length,
+        resolvedCount: afterWait.workers.length - unresolvedWorkers.length
+      })
+      
       await fail(
         planID,
         issue({
           code: "workers_incomplete",
           stage: "running",
-          message: `Workers still active after wait: ${active.length}`,
+          message: `Workers still active after wait: ${active.length} (running: ${runningWorkers.length}, spawning: ${spawningWorkers.length}, pending: ${pendingWorkers.length})`,
         }),
       )
       Metrics.recordPlanOutcome("failed")
@@ -1059,16 +1116,49 @@ export namespace Orchestrator {
       return override ? { ...st, model: override } : st
     })
 
+    // Build a map of old workers by subtask title for matching
+    const oldWorkersByTitle = new Map<string, Plan["workers"][number]>()
+    for (const worker of plan.workers) {
+      const subtask = plan.subtasks.find((st) => st.id === worker.subtaskID)
+      if (subtask) {
+        oldWorkersByTitle.set(subtask.title, worker)
+      }
+    }
+
+    // Preserve successful workers, reset failed/conflict/blocked ones
+    const restoredWorkers = restoredSubtasks.map((st) => {
+      const oldWorker = oldWorkersByTitle.get(st.title)
+
+      // If there's a matching old worker that was successful, preserve it
+      if (oldWorker && (oldWorker.status === "done" || oldWorker.status === "merged")) {
+        return {
+          ...oldWorker,
+          subtaskID: st.id, // Update to new subtask ID
+        }
+      }
+
+      // If old worker was failed, conflict, or blocked, reset to pending for retry
+      if (oldWorker && ["failed", "conflict", "blocked"].includes(oldWorker.status)) {
+        return {
+          subtaskID: st.id,
+          status: "pending" as const,
+        }
+      }
+
+      // New subtask or no matching old worker - create fresh pending worker
+      return {
+        subtaskID: st.id,
+        status: "pending" as const,
+      }
+    })
+
     return PlanStore.update({
       id: planID,
       subtasks: restoredSubtasks,
       sharedContracts: sharedContracts ?? null,
       conventions: conventions ?? null,
       feedback,
-      workers: restoredSubtasks.map((st) => ({
-        subtaskID: st.id,
-        status: "pending" as const,
-      })),
+      workers: restoredWorkers,
       executionMode: plan.executionMode ?? selectExecutionMode(plan, Project.get(plan.projectID)),
       status: "proposed",
     })

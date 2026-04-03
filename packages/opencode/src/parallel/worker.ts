@@ -925,6 +925,7 @@ export namespace WorkerManager {
         .map((worker) => worker.subtaskID),
     )
     const running = new Set<SubtaskID>()
+    const blocked = new Set<SubtaskID>()
     const phaseMode = plan.approvalMode === "phase" || plan.approvalMode === "manual"
 
     // Wave-aware readiness: in auto mode, respect wave ordering
@@ -944,35 +945,172 @@ export namespace WorkerManager {
     const allowed = activeWave ? new Set(activeWave.subtasks) : undefined
 
     function getReadySubtasks(): Subtask[] {
-      return plan.subtasks.filter((st) => {
-        if (completed.has(st.id) || failed.has(st.id) || running.has(st.id)) {
+      const notReadyReasons: Array<{ subtaskID: SubtaskID; reason: string; details?: Record<string, unknown> }> = []
+      
+      const ready = plan.subtasks.filter((st) => {
+        if (completed.has(st.id) || failed.has(st.id) || running.has(st.id) || blocked.has(st.id)) {
+          let reason = "unknown"
+          if (completed.has(st.id)) reason = "already completed"
+          else if (failed.has(st.id)) reason = "already failed"
+          else if (running.has(st.id)) reason = "already running"
+          else if (blocked.has(st.id)) reason = "blocked"
+          notReadyReasons.push({ subtaskID: st.id, reason, details: { status: st.id } })
           return false
         }
-        if (allowed && !allowed.has(st.id)) return false
+        if (allowed && !allowed.has(st.id)) {
+          notReadyReasons.push({ 
+            subtaskID: st.id, 
+            reason: "not in active wave (phase mode)",
+            details: { activeWave: activeWave?.index }
+          })
+          return false
+        }
         // Check explicit dependencies
         const deps = dependencyGraph.get(st.id) ?? new Set()
-        if (!Array.from(deps).every((dep) => completed.has(dep))) return false
+
+        // Check if any dependency has failed - if so, mark this worker as blocked
+        const failedDeps = Array.from(deps).filter((dep) => failed.has(dep))
+        if (failedDeps.length > 0) {
+          // Mark this worker as blocked since a dependency failed
+          blocked.add(st.id)
+          notReadyReasons.push({
+            subtaskID: st.id,
+            reason: "dependency failed - marking as blocked",
+            details: { failedDependencies: failedDeps }
+          })
+          updateWorker(plan.id, st.id, { status: "blocked" }).catch((err) => {
+            log.warn("failed to mark worker as blocked", { subtaskID: st.id, error: err })
+          })
+          return false
+        }
+
+        // Check if any dependency is blocked (deadlock detection for chain dependencies)
+        const blockedDeps = Array.from(deps).filter((dep) => blocked.has(dep))
+        if (blockedDeps.length > 0) {
+          // This subtask is deadlocked - all its dependencies are blocked/failed
+          blocked.add(st.id)
+          notReadyReasons.push({
+            subtaskID: st.id,
+            reason: "dependency blocked (deadlock chain) - marking as blocked",
+            details: { blockedDependencies: blockedDeps }
+          })
+          updateWorker(plan.id, st.id, { status: "blocked", error: "Deadlock: dependency chain failed" }).catch((err) => {
+            log.warn("failed to mark worker as deadlocked", { subtaskID: st.id, error: err })
+          })
+          return false
+        }
+
+        const incompleteDeps = Array.from(deps).filter((dep) => !completed.has(dep))
+        if (incompleteDeps.length > 0) {
+          notReadyReasons.push({
+            subtaskID: st.id,
+            reason: "dependencies not complete",
+            details: { 
+              dependencies: Array.from(deps),
+              incompleteDependencies: incompleteDeps,
+              completedDependencies: Array.from(deps).filter((dep) => completed.has(dep))
+            }
+          })
+          return false
+        }
 
         // In wave mode, also check that all earlier waves are complete
         if (waveAnalysis && waveIndex.has(st.id)) {
           const myWave = waveIndex.get(st.id)!
           for (const wave of waveAnalysis.waves) {
             if (wave.index >= myWave) break
+
+            // Check if any task in earlier waves failed - cascade failure to this wave
+            const earlierWaveFailed = wave.subtasks.filter((id) => failed.has(id))
+            if (earlierWaveFailed.length > 0) {
+              // Mark this worker as blocked since an earlier wave had failures
+              blocked.add(st.id)
+              notReadyReasons.push({
+                subtaskID: st.id,
+                reason: "earlier wave had failures - marking as blocked",
+                details: { 
+                  myWave,
+                  failedWave: wave.index,
+                  failedSubtasksInWave: earlierWaveFailed
+                }
+              })
+              updateWorker(plan.id, st.id, { status: "blocked", error: "Wave dependency failed" }).catch((err) => {
+                log.warn("failed to mark worker as blocked due to wave failure", { subtaskID: st.id, error: err })
+              })
+              return false
+            }
+
             // All subtasks in earlier waves must be completed or failed
-            const allDone = wave.subtasks.every((id) => completed.has(id) || failed.has(id))
-            if (!allDone) return false
+            const incompleteInWave = wave.subtasks.filter((id) => !completed.has(id) && !failed.has(id))
+            if (incompleteInWave.length > 0) {
+              notReadyReasons.push({
+                subtaskID: st.id,
+                reason: "earlier wave not complete",
+                details: { 
+                  myWave,
+                  waitingForWave: wave.index,
+                  incompleteSubtasksInWave: incompleteInWave,
+                  waveType: wave.type
+                }
+              })
+              return false
+            }
           }
 
           // For serial waves, only one subtask from overlapping set runs at a time
           if (waveAnalysis.waves[myWave]?.type === "serial") {
             // If any other subtask in a serial wave at the same index is running, wait
             const myWaveSubtasks = waveAnalysis.waves[myWave].subtasks
-            if (myWaveSubtasks.some((id) => running.has(id))) return false
+            const runningInWave = myWaveSubtasks.filter((id) => running.has(id))
+            if (runningInWave.length > 0) {
+              notReadyReasons.push({
+                subtaskID: st.id,
+                reason: "serial wave - another subtask already running",
+                details: { 
+                  waveIndex: myWave,
+                  runningInWave,
+                  allWaveSubtasks: myWaveSubtasks
+                }
+              })
+              return false
+            }
           }
         }
 
         return true
       })
+
+      // Log detailed debugging information when workers are not ready
+      if (notReadyReasons.length > 0) {
+        const pendingCount = plan.subtasks.filter((st) => 
+          !completed.has(st.id) && 
+          !failed.has(st.id) && 
+          !running.has(st.id) && 
+          !blocked.has(st.id)
+        ).length
+        
+        if (pendingCount > 0) {
+          log.debug("getReadySubtasks: subtasks not ready", {
+            planID: plan.id,
+            totalSubtasks: plan.subtasks.length,
+            pendingCount,
+            completedCount: completed.size,
+            failedCount: failed.size,
+            runningCount: running.size,
+            blockedCount: blocked.size,
+            notReadyBreakdown: notReadyReasons.reduce((acc, item) => {
+              acc[item.reason] = (acc[item.reason] || 0) + 1
+              return acc
+            }, {} as Record<string, number>),
+            sampleNotReady: notReadyReasons.slice(0, 5),
+            dependencyGraphSnapshot: Object.fromEntries(
+              Array.from(dependencyGraph.entries()).map(([k, v]) => [k, Array.from(v)])
+            )
+          })
+        }
+      }
+
+      return ready
     }
 
     log.info("spawning workers with dependencies", {
@@ -992,7 +1130,7 @@ export namespace WorkerManager {
 
     // Preserve terminal state so paused plans can resume from completed waves.
     const initialWorkers = plan.workers.map((w) =>
-      ["done", "merged", "failed", "conflict"].includes(w.status) ? w : { ...w, status: "pending" as const },
+      ["done", "merged", "failed", "conflict", "blocked"].includes(w.status) ? w : { ...w, status: "pending" as const },
     )
     await PlanStore.update({ id: plan.id, workers: initialWorkers })
 
@@ -1034,14 +1172,117 @@ export namespace WorkerManager {
       throw new Error(last)
     }
 
+    // Track consecutive calls with no progress for deadlock detection
+    let noProgressCount = 0
+    const DEADLOCK_THRESHOLD = 3
+
     async function spawnNextBatch(): Promise<void> {
       const ready = getReadySubtasks()
-      if (ready.length === 0) return
-
+      
+      // Calculate current state for logging
+      const remaining = plan.subtasks.filter(
+        (st) => !completed.has(st.id) && !failed.has(st.id) && !running.has(st.id) && !blocked.has(st.id),
+      )
       const availableSlots = maxWorkers ? maxWorkers - running.size : Infinity
-      if (availableSlots <= 0) return
+      
+      log.debug("spawnNextBatch: checking for ready subtasks", {
+        planID: plan.id,
+        readyCount: ready.length,
+        remainingCount: remaining.length,
+        completedCount: completed.size,
+        failedCount: failed.size,
+        runningCount: running.size,
+        blockedCount: blocked.size,
+        maxWorkers,
+        availableSlots: availableSlots === Infinity ? "unlimited" : availableSlots,
+        noProgressCount,
+        totalSubtasks: plan.subtasks.length,
+        schedulerMode,
+        phaseMode,
+        activeWave: activeWave?.index
+      })
+      
+      if (ready.length === 0) {
+        // Check for deadlock: no ready tasks but there are remaining subtasks
+        if (remaining.length > 0) {
+          noProgressCount++
+          log.debug("spawnNextBatch: no ready tasks but remaining subtasks exist", {
+            planID: plan.id,
+            noProgressCount,
+            deadlockThreshold: DEADLOCK_THRESHOLD,
+            remainingSubtasks: remaining.map((st) => ({
+              id: st.id,
+              dependencies: st.dependencies,
+              kind: st.kind
+            })),
+            runningSubtasks: Array.from(running),
+            blockedSubtasks: Array.from(blocked),
+            failedSubtasks: Array.from(failed),
+            completedSubtasks: Array.from(completed)
+          })
+          
+          if (noProgressCount >= DEADLOCK_THRESHOLD) {
+            // Deadlock detected: mark all remaining as blocked
+            log.warn("deadlock detected: marking remaining subtasks as blocked", {
+              planID: plan.id,
+              remainingCount: remaining.length,
+              subtaskIDs: remaining.map((st) => st.id),
+              noProgressCount,
+              waveInfo: waveAnalysis ? {
+                totalWaves: waveAnalysis.waves.length,
+                waves: waveAnalysis.waves.map((w) => ({
+                  index: w.index,
+                  type: w.type,
+                  subtasks: w.subtasks,
+                  complete: w.subtasks.every((id) => completed.has(id)),
+                  hasFailures: w.subtasks.some((id) => failed.has(id)),
+                  incomplete: w.subtasks.filter((id) => !completed.has(id) && !failed.has(id))
+                }))
+              } : undefined
+            })
+            for (const st of remaining) {
+              blocked.add(st.id)
+              await updateWorker(plan.id, st.id, { status: "blocked", error: "Deadlock: dependency chain failed" }).catch(
+                (err) => {
+                  log.warn("failed to mark worker as deadlocked", { subtaskID: st.id, error: err })
+                },
+              )
+            }
+          }
+        } else {
+          log.debug("spawnNextBatch: all subtasks accounted for (no remaining)", {
+            planID: plan.id,
+            completed: completed.size,
+            failed: failed.size,
+            running: running.size,
+            blocked: blocked.size
+          })
+        }
+        return
+      }
+
+      // Reset progress counter when we have ready tasks
+      noProgressCount = 0
+
+      if (availableSlots <= 0) {
+        log.debug("spawnNextBatch: no available slots", {
+          planID: plan.id,
+          maxWorkers,
+          runningCount: running.size,
+          readyCount: ready.length
+        })
+        return
+      }
 
       const toSpawn = ready.slice(0, availableSlots)
+      
+      log.info("spawnNextBatch: spawning workers", {
+        planID: plan.id,
+        spawningCount: toSpawn.length,
+        readyCount: ready.length,
+        availableSlots: availableSlots === Infinity ? "unlimited" : availableSlots,
+        spawningSubtasks: toSpawn.map((st) => st.id)
+      })
 
       for (const st of toSpawn) {
         running.add(st.id)
@@ -1149,9 +1390,9 @@ export namespace WorkerManager {
     }
 
     // Check for dependency failures - apply graceful degradation
-    const blocked: { subtaskID: SubtaskID; error: string }[] = []
+    const blockedWorkers: { subtaskID: SubtaskID; error: string }[] = []
     for (const st of plan.subtasks) {
-      if (!completed.has(st.id) && !failed.has(st.id)) {
+      if (!completed.has(st.id) && !failed.has(st.id) && !blocked.has(st.id)) {
         const failedDeps = st.dependencies.filter((dep) => failed.has(dep))
         if (failedDeps.length === 0) continue
         const succeededDeps = st.dependencies.filter((dep) => completed.has(dep))
@@ -1161,31 +1402,32 @@ export namespace WorkerManager {
             failedDeps: failedDeps.length,
             succeededDeps: succeededDeps.length,
           })
-          blocked.push({
+          blockedWorkers.push({
             subtaskID: st.id,
             error: `Degraded: ${failedDeps.length}/${st.dependencies.length} dependency(s) failed (${succeededDeps.length} succeeded)`,
           })
         } else {
-          blocked.push({ subtaskID: st.id, error: "Blocked: dependency failed" })
+          blockedWorkers.push({ subtaskID: st.id, error: "Blocked: dependency failed" })
         }
       }
     }
 
-    if (blocked.length > 0) {
-      for (const item of blocked) {
-        await updateWorker(plan.id, item.subtaskID, { status: "failed", error: item.error }).catch((err) => {
+    if (blockedWorkers.length > 0) {
+      for (const item of blockedWorkers) {
+        blocked.add(item.subtaskID)
+        await updateWorker(plan.id, item.subtaskID, { status: "blocked", error: item.error }).catch((err) => {
           log.warn("failed to mark worker as blocked", { subtaskID: item.subtaskID, error: err })
         })
       }
     }
 
     const allFailedOrBlocked = plan.subtasks.every(
-      (st) => failed.has(st.id) || blocked.some((b) => b.subtaskID === st.id),
+      (st) => failed.has(st.id) || blocked.has(st.id),
     )
     if (allFailedOrBlocked) {
       throw new Error("All workers failed to spawn or were blocked by failed dependencies")
     }
-    if (plan.subtasks.length > 0 && completed.size === 0 && failed.size === 0 && blocked.length === 0) {
+    if (plan.subtasks.length > 0 && completed.size === 0 && failed.size === 0 && blocked.size === 0) {
       throw new Error("No ready subtasks to spawn. Check dependency graph.")
     }
 
@@ -1194,7 +1436,7 @@ export namespace WorkerManager {
       durationMs: Date.now() - spawnStartTime,
       completed: completed.size,
       failed: failed.size,
-      blocked: blocked.length,
+      blocked: blocked.size,
     })
   }
 
@@ -1588,7 +1830,7 @@ export namespace WorkerManager {
     planID: PlanID,
     subtaskID: SubtaskID,
     update: {
-      status?: "pending" | "spawning" | "running" | "done" | "failed" | "merged" | "conflict"
+      status?: "pending" | "spawning" | "running" | "done" | "failed" | "blocked" | "merged" | "conflict"
       error?: string
       sessionID?: string
       worktreeName?: string
